@@ -15,6 +15,42 @@ pub struct App {
     pub provider: Option<String>,
 }
 
+// ─── Unicode-safe cursor helpers ─────────────────────────────────────────────
+
+/// Returns the byte offset of the nth char boundary in `s`.
+/// `char_idx` is a char index (not byte offset).
+fn char_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+/// Returns the char count of `s`.
+fn char_len(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Insert a string at char position `char_idx`.
+fn insert_str_at(s: &mut String, char_idx: usize, text: &str) {
+    let byte_pos = char_to_byte(s, char_idx);
+    s.insert_str(byte_pos, text);
+}
+
+/// Insert a single char at char position `char_idx`.
+fn insert_char_at(s: &mut String, char_idx: usize, c: char) {
+    let byte_pos = char_to_byte(s, char_idx);
+    s.insert(byte_pos, c);
+}
+
+/// Remove the char at char position `char_idx`.
+fn remove_char_at(s: &mut String, char_idx: usize) {
+    let byte_pos = char_to_byte(s, char_idx);
+    s.remove(byte_pos);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 impl App {
     pub fn new(config: Config, provider: Option<String>) -> Self {
         let ai_enabled = provider.is_some()
@@ -37,45 +73,72 @@ impl App {
                 continue;
             }
 
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if self.handle_key(key.code, key.modifiers).await? {
-                    break;
-                }
-                // re-draw after each key
-                terminal.draw(|f| crate::ui::render(f, &self.state))?;
+            let evt = event::read()?;
+            let should_quit = self.handle_event(evt).await?;
+            if should_quit {
+                break;
             }
+            terminal.draw(|f| crate::ui::render(f, &self.state))?;
         }
         Ok(())
     }
 
-    /// Returns true if the app should quit
-    async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
-        // Global quit
-        if code == KeyCode::Char('q') && self.state.mode != AppMode::Input && !self.state.codex_search_active {
-            if self.state.mode == AppMode::Results
-                || self.state.mode == AppMode::BiasDetail
-                || self.state.mode == AppMode::CodexBrowser
-                || self.state.mode == AppMode::Config
-            {
-                self.state.mode = AppMode::Input;
-                self.state.input_text.clear();
-                self.state.cursor_pos = 0;
-                self.state.rule_results.clear();
-                self.state.ai_result = None;
-                self.state.selected_result_idx = 0;
-                self.state.scroll_offset = 0;
-                self.state.error_message = None;
-                self.state.status_message = None;
-                return Ok(false);
+    /// Returns true if the app should quit.
+    async fn handle_event(&mut self, evt: Event) -> Result<bool> {
+        match evt {
+            // ── Bracketed paste: insert entire pasted string at cursor ──────
+            Event::Paste(pasted) if self.state.mode == AppMode::Input => {
+                self.handle_paste(&pasted);
             }
+
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                return self.handle_key(key.code, key.modifiers).await;
+            }
+
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Insert pasted text, normalising line endings and filtering control chars.
+    fn handle_paste(&mut self, pasted: &str) {
+        // Normalise \r\n → \n, strip other control chars except \n and \t
+        let cleaned: String = pasted
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+            .collect();
+
+        if cleaned.is_empty() {
+            return;
         }
 
+        let pos = self.state.cursor_pos;
+        insert_str_at(&mut self.state.input_text, pos, &cleaned);
+        self.state.cursor_pos += char_len(&cleaned);
+        self.state.error_message = None;
+    }
+
+    /// Returns true if the app should quit.
+    async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
         // Ctrl+C — always quit
         if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
             return Ok(true);
+        }
+
+        // Global 'q' to go back (except when typing in input or codex search)
+        if code == KeyCode::Char('q')
+            && self.state.mode != AppMode::Input
+            && !self.state.codex_search_active
+        {
+            if matches!(
+                self.state.mode,
+                AppMode::Results | AppMode::BiasDetail | AppMode::CodexBrowser | AppMode::Config
+            ) {
+                self.reset_to_input();
+                return Ok(false);
+            }
         }
 
         match self.state.mode {
@@ -84,21 +147,30 @@ impl App {
             AppMode::BiasDetail => self.handle_detail_mode(code).await,
             AppMode::Config => self.handle_config_mode(code).await,
             AppMode::CodexBrowser => self.handle_codex_mode(code, mods).await,
-            AppMode::Analysing => Ok(false), // ignore input while analysing
+            AppMode::Analysing => Ok(false),
         }
+    }
+
+    fn reset_to_input(&mut self) {
+        self.state.mode = AppMode::Input;
+        self.state.input_text.clear();
+        self.state.cursor_pos = 0;
+        self.state.rule_results.clear();
+        self.state.ai_result = None;
+        self.state.selected_result_idx = 0;
+        self.state.scroll_offset = 0;
+        self.state.error_message = None;
+        self.state.status_message = None;
     }
 
     async fn handle_input_mode(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
         match code {
-            // Ctrl+Q or Escape in input — quit
             KeyCode::Esc => return Ok(true),
 
-            // F1 / ? — toggle help
             KeyCode::F(1) => {
                 self.state.show_help = !self.state.show_help;
             }
 
-            // F2 — open codex browser
             KeyCode::F(2) => {
                 self.state.mode = AppMode::CodexBrowser;
                 self.state.codex_scroll = 0;
@@ -106,7 +178,6 @@ impl App {
                 self.state.codex_search_active = false;
             }
 
-            // F3 — toggle AI
             KeyCode::F(3) => {
                 if self.config.ai.is_some() {
                     self.state.ai_enabled = !self.state.ai_enabled;
@@ -117,34 +188,41 @@ impl App {
                     });
                 } else {
                     self.state.error_message = Some(
-                        "No AI configured. Add [ai] section to ~/.config/cbd/config.toml".to_string(),
+                        "No AI configured. Add [ai] section to ~/.config/cbd/config.toml"
+                            .to_string(),
                     );
                 }
             }
 
-            // F4 — config screen
             KeyCode::F(4) => {
                 self.state.mode = AppMode::Config;
             }
 
-            // Enter — analyse
-            KeyCode::Enter if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) => {
-                self.run_analysis().await?;
-            }
+            // F5 or Ctrl+Enter → analyse
             KeyCode::F(5) => {
                 self.run_analysis().await?;
             }
+            KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
+                self.run_analysis().await?;
+            }
+            KeyCode::Enter if mods.contains(KeyModifiers::ALT) => {
+                self.run_analysis().await?;
+            }
 
-            // Regular enter = newline in textarea
+            // Plain Enter → newline in textarea
             KeyCode::Enter => {
                 let pos = self.state.cursor_pos;
-                self.state.input_text.insert(pos, '\n');
+                insert_char_at(&mut self.state.input_text, pos, '\n');
                 self.state.cursor_pos += 1;
             }
 
             KeyCode::Char(c) => {
+                // Ignore Ctrl+key combinations (except Ctrl+Enter handled above)
+                if mods.contains(KeyModifiers::CONTROL) {
+                    return Ok(false);
+                }
                 let pos = self.state.cursor_pos;
-                self.state.input_text.insert(pos, c);
+                insert_char_at(&mut self.state.input_text, pos, c);
                 self.state.cursor_pos += 1;
                 self.state.error_message = None;
             }
@@ -152,15 +230,16 @@ impl App {
             KeyCode::Backspace => {
                 if self.state.cursor_pos > 0 {
                     let pos = self.state.cursor_pos - 1;
-                    self.state.input_text.remove(pos);
+                    remove_char_at(&mut self.state.input_text, pos);
                     self.state.cursor_pos -= 1;
                 }
             }
 
             KeyCode::Delete => {
                 let pos = self.state.cursor_pos;
-                if pos < self.state.input_text.len() {
-                    self.state.input_text.remove(pos);
+                let len = char_len(&self.state.input_text);
+                if pos < len {
+                    remove_char_at(&mut self.state.input_text, pos);
                 }
             }
 
@@ -171,55 +250,80 @@ impl App {
             }
 
             KeyCode::Right => {
-                let len = self.state.input_text.len();
+                let len = char_len(&self.state.input_text);
                 if self.state.cursor_pos < len {
                     self.state.cursor_pos += 1;
                 }
             }
 
             KeyCode::Home => {
-                self.state.cursor_pos = 0;
+                // Move to start of current line
+                let text = self.state.input_text.clone();
+                let pos = self.state.cursor_pos;
+                // Find the char index of the start of the current line
+                let before: String = text.chars().take(pos).collect();
+                let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                self.state.cursor_pos = line_start;
             }
 
             KeyCode::End => {
-                self.state.cursor_pos = self.state.input_text.len();
+                // Move to end of current line
+                let text = self.state.input_text.clone();
+                let pos = self.state.cursor_pos;
+                let after: String = text.chars().skip(pos).collect();
+                let offset = after.find('\n').unwrap_or(after.chars().count());
+                self.state.cursor_pos = pos + offset;
             }
 
             KeyCode::Up => {
-                // Move cursor up a line
-                let text = &self.state.input_text;
-                let pos = self.state.cursor_pos;
-                if let Some(prev_nl) = text[..pos].rfind('\n') {
-                    let line_start = text[..prev_nl].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                    let col = pos - (prev_nl + 1);
-                    let prev_line_len = prev_nl - line_start;
-                    self.state.cursor_pos = line_start + col.min(prev_line_len);
-                } else {
-                    self.state.cursor_pos = 0;
-                }
+                self.move_cursor_vertical(-1);
             }
 
             KeyCode::Down => {
-                let text = self.state.input_text.clone();
-                let pos = self.state.cursor_pos;
-                let current_line_start = text[..pos].rfind('\n').map(|p| p + 1).unwrap_or(0);
-                let col = pos - current_line_start;
-                if let Some(next_nl_offset) = text[pos..].find('\n') {
-                    let next_line_start = pos + next_nl_offset + 1;
-                    let next_line_end = text[next_line_start..]
-                        .find('\n')
-                        .map(|p| next_line_start + p)
-                        .unwrap_or(text.len());
-                    let next_line_len = next_line_end - next_line_start;
-                    self.state.cursor_pos = next_line_start + col.min(next_line_len);
-                } else {
-                    self.state.cursor_pos = text.len();
-                }
+                self.move_cursor_vertical(1);
             }
 
             _ => {}
         }
         Ok(false)
+    }
+
+    /// Move cursor up (-1) or down (+1) by one line, preserving column.
+    fn move_cursor_vertical(&mut self, direction: i32) {
+        let text = &self.state.input_text;
+        let pos = self.state.cursor_pos;
+
+        // Split into char-indexed lines
+        let chars: Vec<char> = text.chars().collect();
+        let total = chars.len();
+
+        // Find current line start/end
+        let line_start = chars[..pos].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+        let col = pos - line_start;
+
+        if direction < 0 {
+            // Move up
+            if line_start == 0 {
+                self.state.cursor_pos = 0;
+                return;
+            }
+            // Previous line ends at line_start - 1
+            let prev_line_end = line_start - 1;
+            let prev_line_start = chars[..prev_line_end].iter().rposition(|&c| c == '\n').map(|i| i + 1).unwrap_or(0);
+            let prev_line_len = prev_line_end - prev_line_start;
+            self.state.cursor_pos = prev_line_start + col.min(prev_line_len);
+        } else {
+            // Move down
+            let next_nl = chars[pos..].iter().position(|&c| c == '\n');
+            if let Some(offset) = next_nl {
+                let next_line_start = pos + offset + 1;
+                let next_nl2 = chars[next_line_start..].iter().position(|&c| c == '\n');
+                let next_line_len = next_nl2.unwrap_or(total - next_line_start);
+                self.state.cursor_pos = next_line_start + col.min(next_line_len);
+            } else {
+                self.state.cursor_pos = total;
+            }
+        }
     }
 
     async fn run_analysis(&mut self) -> Result<()> {
@@ -230,15 +334,13 @@ impl App {
         }
 
         self.state.error_message = None;
-        self.state.status_message = Some("Analysing...".to_string());
+        self.state.status_message = Some("Analysing…".to_string());
         self.state.mode = AppMode::Analysing;
 
-        // Run rule-based analysis (synchronous, fast)
         let rule_results = engine::analyse(&text);
         self.state.rule_results = rule_results;
         self.state.last_analysed = Some(chrono::Local::now());
 
-        // Run AI analysis if enabled
         if self.state.ai_enabled {
             let provider = self
                 .provider
@@ -273,14 +375,8 @@ impl App {
     }
 
     async fn handle_results_mode(&mut self, code: KeyCode, _mods: KeyModifiers) -> Result<bool> {
-        let total = self.state.rule_results.len();
-        let ai_count = self
-            .state
-            .ai_result
-            .as_ref()
-            .map(|r| r.detected_biases.len())
-            .unwrap_or(0);
-        let combined_total = total + ai_count;
+        let total = self.state.rule_results.len()
+            + self.state.ai_result.as_ref().map(|r| r.detected_biases.len()).unwrap_or(0);
 
         match code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -290,32 +386,24 @@ impl App {
                 self.state.scroll_offset = 0;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.state.selected_result_idx + 1 < combined_total {
+                if self.state.selected_result_idx + 1 < total {
                     self.state.selected_result_idx += 1;
                 }
                 self.state.scroll_offset = 0;
             }
             KeyCode::Enter => {
-                if combined_total > 0 {
+                if total > 0 {
                     self.state.mode = AppMode::BiasDetail;
                     self.state.scroll_offset = 0;
                 }
             }
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.state.mode = AppMode::Input;
-                self.state.input_text.clear();
-                self.state.cursor_pos = 0;
-                self.state.rule_results.clear();
-                self.state.ai_result = None;
-                self.state.selected_result_idx = 0;
+                self.reset_to_input();
             }
             KeyCode::Char('e') => {
-                // Re-analyse with AI
                 if self.config.ai.is_some() {
                     self.state.ai_enabled = true;
                     let text = self.state.input_text.clone();
-                    // Re-run full analysis
-                    let mode_backup = AppMode::Results;
                     self.state.mode = AppMode::Analysing;
                     let provider = self
                         .provider
@@ -332,7 +420,6 @@ impl App {
                             self.state.error_message = Some(format!("AI error: {e}"));
                         }
                     }
-                    let _ = mode_backup;
                     self.state.mode = AppMode::Results;
                 } else {
                     self.state.error_message =
@@ -340,7 +427,6 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                // Copy results summary to clipboard via xclip/wl-copy (best-effort)
                 if !self.state.rule_results.is_empty() {
                     let summary = self
                         .state
@@ -349,7 +435,6 @@ impl App {
                         .map(|r| format!("• {} ({})", r.bias_name, r.confidence_label()))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    // Try wl-copy (Wayland) then xclip (X11)
                     let _ = std::process::Command::new("wl-copy").arg(&summary).status();
                     let _ = std::process::Command::new("sh")
                         .arg("-c")
@@ -364,6 +449,9 @@ impl App {
     }
 
     async fn handle_detail_mode(&mut self, code: KeyCode) -> Result<bool> {
+        let total = self.state.rule_results.len()
+            + self.state.ai_result.as_ref().map(|r| r.detected_biases.len()).unwrap_or(0);
+
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                 self.state.mode = AppMode::Results;
@@ -378,29 +466,14 @@ impl App {
                 self.state.scroll_offset += 1;
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                let total = self.state.rule_results.len()
-                    + self
-                        .state
-                        .ai_result
-                        .as_ref()
-                        .map(|r| r.detected_biases.len())
-                        .unwrap_or(0);
                 if self.state.selected_result_idx > 0 {
                     self.state.selected_result_idx -= 1;
-                    self.state.scroll_offset = 0;
                 } else if total > 0 {
                     self.state.selected_result_idx = total - 1;
-                    self.state.scroll_offset = 0;
                 }
+                self.state.scroll_offset = 0;
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                let total = self.state.rule_results.len()
-                    + self
-                        .state
-                        .ai_result
-                        .as_ref()
-                        .map(|r| r.detected_biases.len())
-                        .unwrap_or(0);
                 if total > 0 {
                     self.state.selected_result_idx = (self.state.selected_result_idx + 1) % total;
                     self.state.scroll_offset = 0;
@@ -430,10 +503,8 @@ impl App {
                 KeyCode::Backspace => {
                     self.state.codex_search.pop();
                 }
-                KeyCode::Char(c) => {
-                    if !mods.contains(KeyModifiers::CONTROL) {
-                        self.state.codex_search.push(c);
-                    }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    self.state.codex_search.push(c);
                 }
                 _ => {}
             }
