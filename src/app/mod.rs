@@ -73,11 +73,26 @@ impl App {
                 continue;
             }
 
-            let evt = event::read()?;
-            let should_quit = self.handle_event(evt).await?;
+            // Drain ALL pending events in one batch before re-drawing.
+            // This prevents a large paste burst from causing partial redraws
+            // and ensures Event::Paste is processed atomically before any
+            // stray key event that follows it can trigger a quit.
+            let mut should_quit = false;
+            loop {
+                let evt = event::read()?;
+                if self.handle_event(evt).await? {
+                    should_quit = true;
+                    break;
+                }
+                // Stop draining once the queue is empty.
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
+                }
+            }
             if should_quit {
                 break;
             }
+
             terminal.draw(|f| crate::ui::render(f, &self.state))?;
         }
         Ok(())
@@ -86,12 +101,21 @@ impl App {
     /// Returns true if the app should quit.
     async fn handle_event(&mut self, evt: Event) -> Result<bool> {
         match evt {
-            // ── Bracketed paste: insert entire pasted string at cursor ──────
-            Event::Paste(pasted) if self.state.mode == AppMode::Input => {
-                self.handle_paste(&pasted);
+            // ── Bracketed paste: the terminal wrapped the clipboard in
+            //    ESC[?2004h / ESC[?2004l so crossterm delivers it as a single
+            //    Event::Paste(String).  Handle it regardless of modifier state.
+            Event::Paste(pasted) => {
+                if self.state.mode == AppMode::Input {
+                    self.handle_paste(&pasted);
+                }
+                // Never quit on a paste event.
             }
 
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Ignore all key events that arrive while a bracketed-paste
+                // sequence is being received (mode stays Input the whole time
+                // so this is a no-op guard — the real protection is the
+                // Event::Paste arm above consuming the paste atomically).
                 return self.handle_key(key.code, key.modifiers).await;
             }
 
@@ -122,8 +146,14 @@ impl App {
 
     /// Returns true if the app should quit.
     async fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
-        // Ctrl+C — always quit
-        if code == KeyCode::Char('c') && mods.contains(KeyModifiers::CONTROL) {
+        // Ctrl+C — quit, but ONLY when CONTROL is the sole modifier.
+        // Ctrl+Shift+C (copy in many terminals) must NOT quit.
+        // We also check that SHIFT is NOT set so that terminal paste
+        // shortcuts (Ctrl+Shift+V) can't accidentally hit this path.
+        if code == KeyCode::Char('c')
+            && mods.contains(KeyModifiers::CONTROL)
+            && !mods.contains(KeyModifiers::SHIFT)
+        {
             return Ok(true);
         }
 
@@ -165,7 +195,21 @@ impl App {
 
     async fn handle_input_mode(&mut self, code: KeyCode, mods: KeyModifiers) -> Result<bool> {
         match code {
-            KeyCode::Esc => return Ok(true),
+            // Esc in input mode: only quit when the text box is empty.
+            // If there is text, just clear it (prevents accidental quit
+            // when a terminal sends ESC as part of a non-bracketed paste).
+            KeyCode::Esc => {
+                if self.state.input_text.is_empty() {
+                    return Ok(true);
+                } else {
+                    self.state.input_text.clear();
+                    self.state.cursor_pos = 0;
+                    self.state.error_message = None;
+                    self.state.status_message = Some(
+                        "Text cleared. Press Esc again or Ctrl+C to quit.".to_string(),
+                    );
+                }
+            }
 
             KeyCode::F(1) => {
                 self.state.show_help = !self.state.show_help;
