@@ -26,7 +26,10 @@ impl App {
         Self { state, config, provider }
     }
 
-    pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()> {
+    pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> Result<()>
+    where
+        <B as Backend>::Error: Send + Sync + 'static,
+    {
         loop {
             terminal.draw(|f| crate::ui::render(f, &self.state))?;
 
